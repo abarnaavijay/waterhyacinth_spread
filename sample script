@@ -1,0 +1,174 @@
+#sample script
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var shp = table;
+
+// Cloud Score+ image collection.
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+
+// Region of interest.
+var ROI = shp;
+
+// Use 'cs_cdf' for QA_BAND.
+var QA_BAND = 'cs_cdf';
+
+// The threshold for masking.
+var CLEAR_THRESHOLD = 0.65;
+
+// Make composite.
+var composite = s2
+    .filterBounds(ROI)
+    .filterDate('2023-07-01', '2023-09-30')
+    .linkCollection(csPlus, [QA_BAND])
+    .map(function(img) {
+      return img.updateMask(img.select(QA_BAND).gte(CLEAR_THRESHOLD));
+    })
+    .median()
+    .select(['B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12']);
+var img = composite.clip(ROI)
+var ndvi = composite.normalizedDifference(['B8', 'B4']);
+
+// Display NDVI.
+Map.addLayer(ndvi, {min: -1, max: 1, palette: ['blue','cyan', 'white','red', 'green']}, 'NDVI');
+
+// Center the map on the ROI.
+Map.centerObject(ROI, 10);
+Map.addLayer(composite, {
+  bands: ['B8A', 'B5', 'B4'],min: 0, 
+  max: 10000});
+Map.addLayer(img, {
+  bands: ['B8A', 'B5', 'B4'], // True color visualization (RGB)
+  min: 0, 
+  max: 10000 // Adjust min and max values as needed
+}, 'Median Composite Image');
+
+// Center the map on the ROI.
+Map.centerObject(ROI, 10);
+// Define the bands to be used for classification.
+var bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12'];
+// Load your training data for the three classes.
+var training = water.merge(water_hyacinth).merge(other_vegetation);
+
+// Add a random column for splitting.
+var withRandom = training.randomColumn('random');
+
+// Define the split ratio.
+var split = 0.75;
+
+// Split the data into training and validation sets.
+var trainingSample = withRandom.filter(ee.Filter.lt('random', split));
+var validationSample = withRandom.filter(ee.Filter.gte('random', split));
+
+// Sample regions from the image using the training data.
+var training = img.sampleRegions({
+  collection: trainingSample,
+  properties: ['Class'], // Class labels
+  scale: 10,
+});
+
+// Train the classifier.
+var classifier = ee.Classifier.smileRandomForest(50).train({
+  features: training,
+  classProperty: 'Class',
+  inputProperties: bands
+});
+
+// Classify the composite image.
+var classified = img.classify(classifier).clip(ROI);
+
+// Display the classified image.
+Map.addLayer(classified, {min: 0, max: 2, palette: ['green', 'blue', 'yellow']}, 'Classification');
+
+// Get a confusion matrix and overall accuracy for the validation sample.
+var validation = img.sampleRegions({
+  collection: validationSample,
+  properties: ['Class'], // Class labels
+  scale: 10,
+});
+
+var validationAccuracy = validation.classify(classifier).errorMatrix('Class', 'classification');
+var kappa = validationAccuracy.kappa();
+var producersAccuracy = validationAccuracy.producersAccuracy();
+var consumersAccuracy = validationAccuracy.consumersAccuracy();
+var overallAccuracy = validationAccuracy.accuracy();
+var trainAccuracy = classifier.confusionMatrix();
+var trainOverallAccuracy = trainAccuracy.accuracy();
+print('Training Overall Accuracy:', trainOverallAccuracy);
+// Print accuracy metrics.
+print('Overall Accuracy:', overallAccuracy);
+print('Validation Error Matrix:', validationAccuracy);
+print('Kappa Coefficient:', kappa);
+print('Producers Accuracy:', producersAccuracy);
+print('Consumers Accuracy:', consumersAccuracy);
+
+var classAreas = classified.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(), // Compute frequency of each class
+  geometry: ROI,
+  scale: 10, // Adjust scale as needed
+  maxPixels: 1e12 // Adjust maxPixels as needed
+});
+
+// Get the frequency histogram result.
+var classHistogram = ee.Dictionary(classAreas.get('classification'));
+
+// Print the area of each class.
+print('Class areas:', classHistogram);
+
+// Calculate the area in square kilometers.
+var areaDictSqMeters = classHistogram.map(function(key, value) {
+  var areaSqMeters = ee.Number(value); // Area in square meters
+  var areaSqKm = areaSqMeters.divide(1000000); // Convert square meters to square kilometers
+  return ee.String('Class ').cat(ee.Number.parse(key)).cat(': ').cat(areaSqKm).cat(' sq km');
+});
+
+// Print the area of each class in square kilometers.
+print('Class areas in sq km:', areaDictSqMeters);
+
+Export.image.toDrive({
+  image: classified,
+  description: 'classified_image',
+  folder: 'OCT_DEC', // Change to your desired folder name
+  scale: 10, // Adjust scale as needed
+  region: ROI,
+  fileFormat: 'GeoTIFF'
+});
+// Export the classification accuracy metrics.
+var accuracyDict = {
+  'Training Overall Accuracy': trainOverallAccuracy,
+  'Overall Accuracy': overallAccuracy,
+  'Kappa Coefficient': kappa,
+  'Producers Accuracy': producersAccuracy,
+  'Consumers Accuracy': consumersAccuracy
+};
+var accuracyFeatures = ee.FeatureCollection([
+  ee.Feature(null, accuracyDict)
+]);
+Export.table.toDrive({
+  collection: accuracyFeatures,
+  description: 'classification_accuracy',
+  folder: 'OCT_DEC', // Change to your desired folder name
+  fileFormat: 'CSV'
+});
+
+// Export the class areas.
+var areaDictSqMeters = classHistogram.map(function(key, value) {
+  var areaSqMeters = ee.Number(value); // Area in square meters
+  var areaSqKm = areaSqMeters.divide(1000000); // Convert square meters to square kilometers
+  return ee.Feature(null, {
+    'Class': ee.Number.parse(key),
+    'Area_sq_km': areaSqKm
+  });
+});
+var areaFeatures = ee.FeatureCollection(areaDictSqMeters.values());
+Export.table.toDrive({
+  collection: areaFeatures,
+  description: 'class_areas',
+  folder: 'OCT_DEC', // Change to your desired folder name
+  fileFormat: 'CSV'
+});
+// Save the training data to Google Drive as a GeoJSON file.
+Export.table.toDrive({
+  collection: training,
+  description: 'training_data',
+  folder: 'OCT_DEC', // Change to your desired folder name
+  fileFormat: 'GeoJSON'
+});
